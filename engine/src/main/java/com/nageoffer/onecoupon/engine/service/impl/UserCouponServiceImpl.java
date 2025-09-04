@@ -149,6 +149,7 @@ public class UserCouponServiceImpl implements UserCouponService {
         String couponTemplateCacheKey = String.format(EngineRedisConstant.COUPON_TEMPLATE_KEY, requestParam.getCouponTemplateId());
         String userCouponTemplateLimitCacheKey = String.format(EngineRedisConstant.USER_COUPON_TEMPLATE_LIMIT_KEY, UserContext.getUserId(), requestParam.getCouponTemplateId());
         Long stockDecrementLuaResult = stringRedisTemplate.execute(
+                //返回一个组合值，包含执行状态码和用户已领取次数
                 buildLuaScript,
                 ListUtil.of(couponTemplateCacheKey, userCouponTemplateLimitCacheKey),
                 String.valueOf(couponTemplate.getValidEndTime().getTime()), limitPerPerson
@@ -158,13 +159,16 @@ public class UserCouponServiceImpl implements UserCouponService {
         long firstField = StockDecrementReturnCombinedUtil.extractFirstField(stockDecrementLuaResult);
         if (RedisStockDecrementErrorEnum.isFail(firstField)) {
             throw new ServiceException(RedisStockDecrementErrorEnum.fromType(firstField));
+            //isFail(firstField) 为真时立刻向外抛出异常，并中断当前方法的顺序执行，到不了后面的代码块
         }
 
         // 通过编程式事务执行优惠券库存自减以及增加用户优惠券领取记录
         long extractSecondField = StockDecrementReturnCombinedUtil.extractSecondField(stockDecrementLuaResult);
         transactionTemplate.executeWithoutResult(status -> {
+            //开发者用 TransactionTemplate / PlatformTransactionManager 等 API 在代码块里控制事务边界与异常处理
             try {
                 int decremented = couponTemplateMapper.decrementCouponTemplateStock(Long.parseLong(requestParam.getShopNumber()), Long.parseLong(requestParam.getCouponTemplateId()), 1L);
+                // 1L 是指本次要扣减的库存数量为 1
                 if (!SqlHelper.retBool(decremented)) {
                     throw new ServiceException("优惠券已被领取完啦");
                 }
@@ -199,15 +203,18 @@ public class UserCouponServiceImpl implements UserCouponService {
                     Double scored;
                     try {
                         scored = stringRedisTemplate.opsForZSet().score(userCouponListCacheKey, userCouponItemCacheKey);
+                        //score(...)：ZSet 的查询方法，返回指定元素在该有序集合中的分数（score）。若元素不存在，返回null；若存在，返回其分数值（Double 类型）
                         // scored 为空意味着可能 Redis Cluster 主从同步丢失了数据，比如 Redis 主节点还没有同步到从节点就宕机了，解决方案就是再新增一次
                         if (scored == null) {
                             // 如果这里也新增失败了怎么办？我们大概率做不到绝对的万无一失，只能尽可能增加成功率
                             stringRedisTemplate.opsForZSet().add(userCouponListCacheKey, userCouponItemCacheKey, now.getTime());
+                            // Redis 与 MQ 操作在同一 try {...} 里，但它们不是数据库事务资源，即它们不会随数据库回滚而自动回滚。
                         }
                     } catch (Throwable ex) {
                         log.warn("查询Redis用户优惠券记录为空或抛异常，可能Redis宕机或主从复制数据丢失，基础错误信息：{}", ex.getMessage());
                         // 如果直接抛异常大概率 Redis 宕机了，所以应该写个延时队列向 Redis 重试放入值。为了避免代码复杂性，这里直接写新增，大家知道最优解决方案即可
                         stringRedisTemplate.opsForZSet().add(userCouponListCacheKey, userCouponItemCacheKey, now.getTime());
+                        // Redis 与 MQ 操作在同一 try {...} 里，但它们不是数据库事务资源，即它们不会随数据库回滚而自动回滚。
                     }
 
                     // 发送延时消息队列，等待优惠券到期后，将优惠券信息从缓存中删除
@@ -218,6 +225,7 @@ public class UserCouponServiceImpl implements UserCouponService {
                             .delayTime(validEndTime.getTime())
                             .build();
                     SendResult sendResult = couponDelayCloseProducer.sendMessage(userCouponDelayCloseEvent);
+                    // Redis 与 MQ 操作在同一 try {...} 里，但它们不是数据库事务资源，即它们不会随数据库回滚而自动回滚。
 
                     // 发送消息失败解决方案简单且高效的逻辑之一：打印日志并报警，通过日志搜集并重新投递
                     if (ObjectUtil.notEqual(sendResult.getSendStatus().name(), "SEND_OK")) {
@@ -225,7 +233,7 @@ public class UserCouponServiceImpl implements UserCouponService {
                     }
                 }
             } catch (Exception ex) {
-                status.setRollbackOnly();
+                status.setRollbackOnly();   // // 显式标记回滚,即使你后续把异常“吞掉”或转译为业务异常抛出，当前事务仍会被回滚。
                 // 优惠券已被领取完业务异常
                 if (ex instanceof ServiceException) {
                     throw (ServiceException) ex;
@@ -236,7 +244,7 @@ public class UserCouponServiceImpl implements UserCouponService {
                 }
                 throw new ServiceException("优惠券领取异常，请稍候再试");
             }
-        });
+        }); //这里出 lambda 时，若未标记回滚并且未抛异常 -> 提交；否则回滚
     }
 
     @Override

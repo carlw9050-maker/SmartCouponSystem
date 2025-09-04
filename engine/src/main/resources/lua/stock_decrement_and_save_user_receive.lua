@@ -6,6 +6,10 @@
 -- ARGV[1]: 优惠券有效期结束时间 (timestamp)
 -- ARGV[2]: 用户领取上限 (limit)
 
+--firstField：状态码，占高位（左移 14 位，范围 0–2）。
+--secondField：领取次数，占低 14 位。
+--Redis 脚本只能返回单个值，通过这种位运算+拼接方式把多个结果装进一个整数里
+
 local function combineFields(firstField, secondField)
     -- 确定 SECOND_FIELD_BITS 为 14，因为 secondField 最大为 9999
     local SECOND_FIELD_BITS = 14
@@ -23,6 +27,7 @@ end
 
 -- 获取当前库存
 local stock = tonumber(redis.call('HGET', KEYS[1], 'stock'))
+--KEYS[1]: 优惠券库存键 (coupon_stock_key)
 
 -- 判断库存是否大于 0
 if stock <= 0 then
@@ -31,8 +36,9 @@ end
 
 -- 获取用户领取的优惠券次数
 local userCouponCount = tonumber(redis.call('GET', KEYS[2]))
+--KEYS[2]: 用户领取记录键 (user_coupon_key)
 
--- 如果用户领取次数不存在，则初始化为 0
+--如果不存在，说明用户从未领取过，初始化为 0。
 if userCouponCount == nil then
     userCouponCount = 0
 end
@@ -44,9 +50,10 @@ end
 
 -- 增加用户领取的优惠券次数
 if userCouponCount == 0 then
-    -- 如果用户第一次领取，则需要添加过期时间
+    -- 如果用户第一次领取，把次数设置为 1，需要添加过期时间
     redis.call('SET', KEYS[2], 1)
     redis.call('EXPIRE', KEYS[2], ARGV[1])
+    --KEYS[2]: 用户领取记录键 (user_coupon_key)
 else
     -- 因为第一次领取已经设置了过期时间，第二次领取沿用之前即可
     redis.call('INCR', KEYS[2])
