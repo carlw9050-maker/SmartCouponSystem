@@ -173,6 +173,10 @@ public class CouponTaskServiceImpl extends ServiceImpl<CouponTaskMapper, CouponT
         return BeanUtil.toBean(couponTaskDO, CouponTaskQueryRespDTO.class);
     }
 
+    /**
+     * 因为线程池和延迟队列都有可能用到 excel 解析的功能，于是把解析功能抽象出来作为一个单独的方法
+     * @param delayJsonObject
+     */
     private void refreshCouponTaskSendNum(JSONObject delayJsonObject) {
         // 通过 EasyExcel 监听器获取 Excel 中所有行数
         RowCountListener listener = new RowCountListener();

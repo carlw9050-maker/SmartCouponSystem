@@ -7,6 +7,26 @@ local couponTemplateId = KEYS[3]  -- 优惠券模板 ID
 local currentTime = tonumber(ARGV[3])  -- 获取当前 Unix 时间戳（毫秒）
 local couponTemplateValidEndTime = tonumber(ARGV[4])  -- 优惠券模板到期时间
 
+--[[
+    输入 KEYS
+
+    KEYS[1] = userIdPrefix → 用户领券 ZSet 的 key 前缀，例如 user_coupon_list:，后面拼接 userId。
+
+    KEYS[2] = limitKeyPrefix → 用户领取限制 key 前缀，例如 user_coupon_limit:。
+
+    KEYS[3] = couponTemplateId → 本次发放的券模板 ID。
+
+    输入 ARGV
+
+    ARGV[1] = userIds → 一批用户 ID，JSON 数组格式。
+
+    ARGV[2] = couponIds → 一批券 ID，JSON 数组格式，与 userIds 一一对应。
+
+    ARGV[3] = currentTime → 当前时间戳（毫秒），用作 ZSet score。
+
+    ARGV[4] = couponTemplateValidEndTime → 优惠券模板到期时间（秒），作为限领 key 的过期时间。
+    ]]
+
 -- 遍历用户 ID 集合
 for i, userId in ipairs(userIds) do
     local key = userIdPrefix .. userId  -- 拼接用户 ID 前缀和用户 ID

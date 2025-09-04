@@ -102,19 +102,25 @@ public class ReadExcelDistributionListener extends AnalysisEventListener<CouponT
 
         // 执行 LUA 脚本进行扣减库存以及增加 Redis 用户领券记录
         String couponTemplateKey = String.format(EngineRedisConstant.COUPON_TEMPLATE_KEY, couponTemplateDO.getId());
+        //模板常量与模板 ID 进行拼接，构建 key
         String batchUserSetKey = String.format(DistributionRedisConstant.TEMPLATE_TASK_EXECUTE_BATCH_USER_KEY, couponTaskId);
+
         Map<Object, Object> userRowNumMap = MapUtil.builder()
                 .put("userId", data.getUserId())
+                //data 是 CouponTaskExcelObject，代表 Excel 文件里当前这一行的解析结果
                 .put("rowNum", rowCount + 1)
                 .build();
         Long combinedFiled = stringRedisTemplate.execute(buildLuaScript, ListUtil.of(couponTemplateKey, batchUserSetKey), JSON.toJSONString(userRowNumMap));
-
         // firstField 为 false 说明优惠券已经没有库存了
+        // 往 batchUserSetKey 里保存了 userRowNumMap
         boolean firstField = StockDecrementReturnCombinedUtil.extractFirstField(combinedFiled);
         if (!firstField) {
             // 同步当前执行进度到缓存
             stringRedisTemplate.opsForValue().set(templateTaskExecuteProgressKey, String.valueOf(rowCount));
             ++rowCount;
+            //这里行号加 1 的含义：这行业务失败，不会发券也不会进批集合。
+            //动作：写进度→行号+1→写失败表→返回。
+            //结果：这行被永久跳过且有失败原因可追溯；不会等后续批处理。
 
             // 添加到 t_coupon_task_fail 并标记错误原因，方便后续查看未成功发送的原因和记录
             Map<Object, Object> objectMap = MapUtil.builder()
@@ -139,6 +145,9 @@ public class ReadExcelDistributionListener extends AnalysisEventListener<CouponT
             ++rowCount;
             return;
         }
+        //这里的行号 + 1 的含义：这行处理成功扣库存并已加入“批集合”，只是不触发消息（等攒够一批）。
+        //动作：写进度→行号+1→返回。
+        //结果：这行已处理、待与后续行一起在“批满/结束标记”时统一下发；没有失败记录。
 
         CouponTemplateDistributionEvent couponTemplateDistributionEvent = CouponTemplateDistributionEvent.builder()
                 .userId(data.getUserId())

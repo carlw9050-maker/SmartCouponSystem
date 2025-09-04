@@ -144,7 +144,7 @@ public class CouponExecuteDistributionConsumer implements RocketMQListener<Messa
 
             decrementCouponTemplateStockAndSaveUserCouponList(event);
             List<String> batchUserMaps = stringRedisTemplate.opsForSet().pop(batchUserSetKey, Integer.MAX_VALUE);
-            // 此时待保存入库用户优惠券列表如果还有值，就意味着可能库存不足引起的
+            // 经历了优惠券扣减后，待领取用户集合此时如果还有值，就意味着可能库存不足引起的
             if (CollUtil.isNotEmpty(batchUserMaps)) {
                 // 添加到 t_coupon_task_fail 并标记错误原因，方便后续查看未成功发送的原因和记录
                 List<CouponTaskFailDO> couponTaskFailDOList = new ArrayList<>(batchUserMaps.size());
@@ -167,6 +167,8 @@ public class CouponExecuteDistributionConsumer implements RocketMQListener<Messa
             long initId = 0;
             boolean isFirstIteration = true;  // 用于标识是否为第一次迭代
             String failFileAddress = excelPath + "/用户分发记录失败Excel-" + event.getCouponTaskBatchId() + ".xlsx";
+            //分页查询失败表（LIMIT 5000），把 {rowNum, cause} 按 Sheet 逐页写出到本地 .../用户分发记录失败Excel-{batchId}.xlsx。
+            //若一次都查不到失败记录，文件地址置空（避免误导）。
 
             // 这里应该上传云 OSS 或者 MinIO 等存储平台，但是增加部署成功并且不太好往简历写就仅写入本地
             try (ExcelWriter excelWriter = EasyExcel.write(failFileAddress, UserCouponTaskFailExcelObject.class).build()) {
@@ -218,13 +220,16 @@ public class CouponExecuteDistributionConsumer implements RocketMQListener<Messa
     private void decrementCouponTemplateStockAndSaveUserCouponList(CouponTemplateDistributionEvent event) {
         // 如果等于 0 意味着已经没有了库存，直接返回即可
         Integer couponTemplateStock = decrementCouponTemplateStock(event, event.getBatchUserSetSize());
+        // couponTemplateStock 只有两个取值，要么是计划扣减量（库存足时），要么是扣减之前的实际库存量（库存量不足时）
         if (couponTemplateStock <= 0) {
             return;
         }
 
         // 获取 Redis 中待保存入库用户优惠券列表
         String batchUserSetKey = String.format(DistributionRedisConstant.TEMPLATE_TASK_EXECUTE_BATCH_USER_KEY, event.getCouponTaskId());
+        //优惠券模板某发放批次的领取用户集合
         List<String> batchUserMaps = stringRedisTemplate.opsForSet().pop(batchUserSetKey, couponTemplateStock);
+        //弹出 couponTemplateStock 个用户，couponTemplateStock 是计划扣减数，或者是剩余库存量
 
         // 因为 batchUserIds 数据较多，ArrayList 会进行数次扩容，为了避免额外性能消耗，直接初始化 batchUserIds 大小的数组
         List<UserCouponDO> userCouponDOList = new ArrayList<>(batchUserMaps.size());
@@ -257,20 +262,20 @@ public class CouponExecuteDistributionConsumer implements RocketMQListener<Messa
 
         // 将这些优惠券添加到用户的领券记录中
         List<String> userIdList = userCouponDOList.stream()
-                .map(UserCouponDO::getUserId)
-                .map(String::valueOf)
+                .map(UserCouponDO::getUserId)   // 提取用户 ID
+                .map(String::valueOf)   // 转成字符串
                 .toList();
-        String userIdsJson = new ObjectMapper().writeValueAsString(userIdList);
+        String userIdsJson = new ObjectMapper().writeValueAsString(userIdList); //JSON 数组
 
         List<String> couponIdList = userCouponDOList.stream()
                 .map(each -> StrUtil.builder()
-                        .append(event.getCouponTemplateId())
+                        .append(event.getCouponTemplateId())    // 提取优惠券模板 ID
                         .append("_")
-                        .append(each.getId())
+                        .append(each.getId())   //用户券 ID
                         .toString())
                 .map(String::valueOf)
                 .toList();
-        String couponIdsJson = new ObjectMapper().writeValueAsString(couponIdList);
+        String couponIdsJson = new ObjectMapper().writeValueAsString(couponIdList);     //JSON 数组
 
         // 调用 Lua 脚本时，传递参数
         List<String> keys = Arrays.asList(
@@ -302,16 +307,19 @@ public class CouponExecuteDistributionConsumer implements RocketMQListener<Messa
         stringRedisTemplate.execute(buildLuaScript, keys, args.toArray());
 
         // 增加库存回滚方案，如果用户已经领取优惠券被校验，需要将 Redis 预扣减库存回滚
+
         int originalUserCouponSize = batchUserMaps.size();
+        //batchUserMaps 插入数据库前的待领券用户
         // 如果用户已领取被校验会从集合中删除
         int availableUserCouponSize = userCouponDOList.size();
+        // userCouponDOList 是已经删除重复领券用户后的
         int rollbackStock = originalUserCouponSize - availableUserCouponSize;
         if (rollbackStock > 0) {
             // 回滚优惠券模板缓存库存数量
             stringRedisTemplate.opsForHash().increment(
-                    String.format(EngineRedisConstant.COUPON_TEMPLATE_KEY, event.getCouponTemplateId()),
-                    "stock",
-                    rollbackStock
+                    String.format(EngineRedisConstant.COUPON_TEMPLATE_KEY, event.getCouponTemplateId()),    //找到特定优惠券模板
+                    "stock",//Hash 里的字段，存的是该模板的库存数量
+                    rollbackStock   //调用 Redis HINCRBY 命令，让库存数增加 rollbackStock
             );
 
             // 回滚优惠券模板数据库库存数量
@@ -320,11 +328,16 @@ public class CouponExecuteDistributionConsumer implements RocketMQListener<Messa
     }
 
     private Integer decrementCouponTemplateStock(CouponTemplateDistributionEvent event, Integer decrementStockSize) {
+        //先尝试按“计划数量”一次性扣减数据库库存（通常是 stock = stock - N where stock >= N 一类条件更新）。
+        //若返回“未更新”（说明库存不够），读取当前剩余库存，改用剩余库存数再扣一次（递归）。
+        //目的是尽最大可能把能发的都发出去。
         Long couponTemplateId = event.getCouponTemplateId();
         int decremented = couponTemplateMapper.decrementCouponTemplateStock(event.getShopNumber(), couponTemplateId, decrementStockSize);
 
         // 如果修改记录失败，意味着优惠券库存已不足，需要重试获取到可自减的库存数值
         if (!SqlHelper.retBool(decremented)) {
+            //用 MyBatis-Plus 的工具类SqlHelper.retBool判断库存扣减是否成功：
+            //decremented为 0 时，SqlHelper.retBool(decremented)返回false，表示 “扣减失败”（本质是库存不足，无法满足计划扣减数量）；
             LambdaQueryWrapper<CouponTemplateDO> queryWrapper = Wrappers.lambdaQuery(CouponTemplateDO.class)
                     .eq(CouponTemplateDO::getShopNumber, event.getShopNumber())
                     .eq(CouponTemplateDO::getId, couponTemplateId);
@@ -337,6 +350,9 @@ public class CouponExecuteDistributionConsumer implements RocketMQListener<Messa
 
     private void batchSaveUserCouponList(Long couponTemplateId, Long couponTaskBatchId, List<UserCouponDO> userCouponDOList) {
         // MyBatis-Plus 批量执行用户优惠券记录
+        //优先批量插入；若批量失败（常见于唯一约束冲突），退化为单条尝试：
+        //单条仍失败 → 调 hasUserReceivedCoupon() 判定是否已领过，是则进失败表。
+        //成功的保留在列表中，继续进入“写用户缓存”。
         try {
             userCouponMapper.insert(userCouponDOList, userCouponDOList.size());
         } catch (Exception ex) {
@@ -391,6 +407,7 @@ public class CouponExecuteDistributionConsumer implements RocketMQListener<Messa
      */
     @Transactional(propagation = Propagation.NOT_SUPPORTED, readOnly = true)
     public Boolean hasUserReceivedCoupon(Long couponTemplateId, Long userId) {
+        //只读查询（NOT_SUPPORTED 事务），按 userId + couponTemplateId 判定是否已存在记录。
         LambdaQueryWrapper<UserCouponDO> queryWrapper = Wrappers.lambdaQuery(UserCouponDO.class)
                 .eq(UserCouponDO::getUserId, userId)
                 .eq(UserCouponDO::getCouponTemplateId, couponTemplateId);
