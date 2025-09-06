@@ -345,8 +345,10 @@ public class UserCouponServiceImpl implements UserCouponService {
             if (couponTemplate.getTarget().equals(0)) {
                 // 获取第一个匹配的商品
                 Optional<CouponCreatePaymentGoodsReqDTO> matchedGoods = requestParam.getGoodsList().stream()
+                        //Optional 是 Java 8 引入的容器类，用于表示一个值可能存在或不存在
                         .filter(each -> Objects.equals(couponTemplate.getGoods(), each.getGoodsNumber()))
                         .findFirst();
+                //.findFirst() 从筛选后的结果中获取第一个元素
 
                 if (matchedGoods.isEmpty()) {
                     throw new ClientException("商品信息与优惠券模板不符");
@@ -355,7 +357,10 @@ public class UserCouponServiceImpl implements UserCouponService {
                 // 验证折扣金额
                 CouponCreatePaymentGoodsReqDTO paymentGoods = matchedGoods.get();
                 BigDecimal maximumDiscountAmount = consumeRule.getBigDecimal("maximumDiscountAmount");
+                //getBigDecimal("maximumDiscountAmount") 是调用 consumeRule 对象的方法，根据键 "maximumDiscountAmount" 获取对应的值
                 if (!paymentGoods.getGoodsAmount().subtract(maximumDiscountAmount).equals(paymentGoods.getGoodsPayableAmount())) {
+                    //paymentGoods.getGoodsAmount()：该商品的原始金额（未打折前）
+                    //校验前端（或上游）传来的该商品的应付金额是否与“原价 − 最大可减金额”相等
                     throw new ClientException("商品折扣后金额异常");
                 }
 
@@ -433,6 +438,7 @@ public class UserCouponServiceImpl implements UserCouponService {
                     .append(userCouponDO.getId())
                     .toString();
             stringRedisTemplate.opsForZSet().remove(String.format(USER_COUPON_TEMPLATE_LIST_KEY, UserContext.getUserId()), userCouponItemCacheKey);
+            //userCouponItemCacheKey 是 ZSet 集合里的一个元素（member）
         } finally {
             lock.unlock();
         }

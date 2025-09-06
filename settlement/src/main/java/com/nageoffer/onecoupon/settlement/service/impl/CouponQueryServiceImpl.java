@@ -217,31 +217,43 @@ public class CouponQueryServiceImpl implements CouponQueryService {
      */
     public QueryCouponsRespDTO listQueryUserCouponsBySync(QueryCouponsReqDTO requestParam) {
         Set<String> rangeUserCoupons = stringRedisTemplate.opsForZSet().range(String.format(USER_COUPON_TEMPLATE_LIST_KEY, UserContext.getUserId()), 0, -1);
-
+        // 拿到特定用户的所有 member。
         List<String> couponTemplateIds = rangeUserCoupons.stream()
                 .map(each -> StrUtil.split(each, "_").get(0))
                 .map(each -> redisDistributedProperties.getPrefix() + String.format(COUPON_TEMPLATE_KEY, each))
                 .toList();
+        // 从 member 里抽出 templateId 并组装每个模板的 Redis Key
         List<Object> couponTemplateList = stringRedisTemplate.executePipelined((RedisCallback<String>) connection -> {
+            //executePipelined(...)：执行 Redis 管道操作的核心方法
             couponTemplateIds.forEach(each -> connection.hashCommands().hGetAll(each.getBytes()));
+            // forEach(key -> ...)：遍历每个键，对每个键执行后续的 Redis 命令
+            //connection：Redis 的底层连接对象，通过它可以调用各种 Redis 命令，如 hashCommands()操作 Hash 结构
+            // hGetAll(key.getBytes())：执行 Redis 的HGETALL命令，查询指定键（key）对应的 Hash 结构中所有的字段（field）和值（value）。
+            // key.getBytes()：将键转换为字节数组，等于绕过了模板默认序列化器，因此返回值通常是 Map<byte[], byte[]> 的集合
             return null;
+            //管道回调函数的返回值为null，因为实际结果会由executePipelined方法统一收集并返回（即前面的couponTemplateList），这里无需单独返回
         });
 
         List<CouponTemplateQueryRespDTO> couponTemplateDTOList = JSON.parseArray(JSON.toJSONString(couponTemplateList), CouponTemplateQueryRespDTO.class);
+        //因为 pipeline 回来的对象多半是 List<Map<byte[], byte[]>>，把字节 Map 序列化成 JSON，再反序列化为 CouponTemplateQueryRespDTO
+        //做了一个“通用解码”的取巧转换
         Map<Boolean, List<CouponTemplateQueryRespDTO>> partitioned = couponTemplateDTOList.stream()
                 .collect(Collectors.partitioningBy(coupon -> StrUtil.isEmpty(coupon.getGoods())));
+        //按优惠券类型对优惠券分组，goods 为空 → 店铺券/通用券（对整单生效，记为 goodsEmptyList）。goods 不为空 → 商品券（只对特定商品生效，记为 goodsNotEmptyList）。
 
         // 拆分后的两个列表
         List<CouponTemplateQueryRespDTO> goodsEmptyList = partitioned.get(true); // goods 为空的列表
         List<CouponTemplateQueryRespDTO> goodsNotEmptyList = partitioned.get(false); // goods 不为空的列表
 
-        // 针对当前订单可用/不可用的优惠券列表
+        // 准备两个输出桶，用来装针对当前订单可用/不可用的优惠券
         List<QueryCouponsDetailRespDTO> availableCouponList = new ArrayList<>();
         List<QueryCouponsDetailRespDTO> notAvailableCouponList = new ArrayList<>();
 
         goodsEmptyList.forEach(each -> {
             JSONObject jsonObject = JSON.parseObject(each.getConsumeRule());
+            //提取每张券的消费规则
             QueryCouponsDetailRespDTO resultQueryCouponDetail = BeanUtil.toBean(each, QueryCouponsDetailRespDTO.class);
+            //提取每张券的详细信息
             BigDecimal maximumDiscountAmount = jsonObject.getBigDecimal("maximumDiscountAmount");
             switch (each.getType()) {
                 case 0: // 立减券
@@ -278,6 +290,7 @@ public class CouponQueryServiceImpl implements CouponQueryService {
 
         Map<String, QueryCouponGoodsReqDTO> goodsRequestMap = requestParam.getGoodsList().stream()
                 .collect(Collectors.toMap(QueryCouponGoodsReqDTO::getGoodsNumber, Function.identity(), (existing, replacement) -> existing));
+        //先把本次下单商品列表 goodsList 转成 Map<goodsNumber, QueryCouponGoodsReqDTO>，便于 O(1) 查找
 
         goodsNotEmptyList.forEach(each -> {
             QueryCouponGoodsReqDTO couponGoods = goodsRequestMap.get(each.getGoods());
